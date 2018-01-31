@@ -18,14 +18,17 @@ const cp = require("child_process");
 const fs = require("fs");
 const EventEmitter = require("events");
 const https = require("https");
-const Discord = require("discord.js");
+const Discord = require("eris");
 const ogg = require("./craig-ogg.js");
 
-const clientOptions = {fetchAllMembers: false, apiRequestMethod: "sequential"};
-
-const client = new Discord.Client(clientOptions);
-const clients = [client]; // For secondary connections
 const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
+const client = new Discord(config.token);
+const clients = [client]; // For secondary connections
+
+// Are these constants SERIOUSLY not exposed by Eris at all???
+const TEXT_CHANNEL = 0;
+const DM_CHANNEL = 1;
+const VOICE_CHANNEL = 2;
 
 if (!("nick" in config))
     config.nick = "Craig";
@@ -54,8 +57,8 @@ function accessSyncer(file) {
 // Convenience functions to turn entities into name#id strings:
 function nameId(entity) {
     var nick = "";
-    if ("displayName" in entity) {
-        nick = entity.displayName;
+    if ("nick" in entity && entity.nick) {
+        nick = entity.nick;
     } else if ("username" in entity) {
         nick = entity.username;
     } else if ("name" in entity) {
@@ -99,12 +102,12 @@ function guildRefresh(guild) {
 }
 
 // Log in
-client.login(config.token).catch(()=>{});
+client.connect();
 
 // If there are secondary Craigs, log them in
 for (var si = 0; si < config.secondary.length; si++) {
-    clients.push(new Discord.Client(clientOptions));
-    clients[si+1].login(config.secondary[si].token).catch(()=>{});
+    clients.push(new Discord(config.secondary[si].token));
+    clients[si+1].connect();
 }
 
 var log;
@@ -135,11 +138,13 @@ function reply(msg, dm, prefix, pubtext, privtext) {
             privtext = pubtext + "\n\n" + privtext;
         log("Reply to " + nameId(msg.author) + ": " + privtext);
 
-        function rereply() {
+        function rereply(err) {
             reply(msg, false, prefix, "I can't send you direct messages. " + pubtext);
         }
         try {
-            msg.author.send(privtext).catch(rereply);
+            msg.author.getDMChannel().then((dmc) => {
+                dmc.createMessage(privtext).catch(rereply);
+            }).catch(rereply);
         } catch (ex) {
             rereply();
         }
@@ -148,30 +153,32 @@ function reply(msg, dm, prefix, pubtext, privtext) {
 
     // Try to send it by conventional means
     log("Public reply to " + nameId(msg.author) + ": " + pubtext);
-    msg.reply((prefix ? (prefix + " <(") : "") +
-              pubtext +
-              (prefix ? ")" : "")).catch((err) => {
+    msg.channel.createMessage(
+        msg.author.mention + ", " +
+        (prefix ? (prefix + " <(") : "") +
+        pubtext +
+        (prefix ? ")" : "")).catch((err) => {
 
     log("Failed to reply to " + nameId(msg.author));
 
     // If this wasn't a guild message, nothing to be done
-    var guild = msg.guild;
+    var guild = msg.channel.guild;
     if (!guild)
         return;
 
     /* We can't get a message to them properly, so try to get a message out
      * that we're stimied */
-    guild.channels.some((channel) => {
-        if (channel.type !== "text")
+    guild.channels.find((channel) => {
+        if (channel.type !== TEXT_CHANNEL)
             return false;
 
-        var perms = channel.permissionsFor(client.user);
+        var perms = channel.permissionsOf(client.user.id);
         if (!perms)
             return false;
 
-        if (perms.hasPermission("SEND_MESSAGES")) {
+        if (perms.has("sendMessages")) {
             // Finally!
-            channel.send("Sorry to spam this channel, but I don't have privileges to respond in the channel you talked to me in! Please give me permission to talk :(");
+            channel.createMessage("Sorry to spam this channel, but I don't have privileges to respond in the channel you talked to me in! Please give me permission to talk :(");
             return true;
         }
 
@@ -180,7 +187,7 @@ function reply(msg, dm, prefix, pubtext, privtext) {
 
     try {
         // Give ourself a name indicating error
-        guild.members.get(client.user.id).setNickname("ERROR CANNOT SEND MESSAGES").catch(() => {});
+        guild.editNickname("ERROR CANNOT SEND MESSAGES").catch(() => {});
     } catch (ex) {}
 
     });
@@ -234,6 +241,7 @@ if (process.channel) {
 
 // Our recording session proper
 function session(msg, prefix, rec) {
+    var guild = rec.guild;
     var connection = rec.connection;
     var id = rec.id;
     var client = rec.client;
@@ -243,7 +251,9 @@ function session(msg, prefix, rec) {
         reply(msg, dm, prefix, pubtext, privtext);
     }
 
-    var receiver = connection.createReceiver();
+    var receiver = connection.receive("opus");
+
+    // Time limit
     const partTimeout = setTimeout(() => {
         log("Terminating " + id + ": Time limit.");
         sReply(true, "Sorry, but you've hit the recording time limit. Recording stopped.");
@@ -253,7 +263,7 @@ function session(msg, prefix, rec) {
 
     // Rename ourself to indicate that we're recording
     try {
-        connection.channel.guild.members.get(client.user.id).setNickname(nick + " [RECORDING]").catch((err) => {
+        guild.editNickname(nick + " [RECORDING]").catch((err) => {
             log("Terminating " + id + ": Lack nick change permission.");
             sReply(true, "I do not have permission to change my nickname on this server. I will not record without this permission.");
             rec.disconnected = true;
@@ -267,9 +277,6 @@ function session(msg, prefix, rec) {
     } catch(ex) {}
     recordingEvents.emit("start", rec);
 
-    // Our input Opus streams by user
-    var userOpusStreams = {};
-
     // Track numbers for each active user
     var userTrackNos = {};
 
@@ -280,7 +287,7 @@ function session(msg, prefix, rec) {
     var trackNo = 1;
 
     // Set up our recording OGG header and data file
-    var startTime = process.hrtime();
+    var startTime = 0;
     var recFileBase = "rec/" + id + ".ogg";
 
     // Set up our recording streams
@@ -306,11 +313,8 @@ function session(msg, prefix, rec) {
     var recOggHStream = [ new ogg.OggEncoder(recFHStream[0]), new ogg.OggEncoder(recFHStream[1]) ];
     var recOggStream = new ogg.OggEncoder(recFStream);
 
-    // Function to encode a single Opus chunk to the ogg file
-    function encodeChunk(oggStream, streamNo, packetNo, chunk) {
-        var chunkTime = process.hrtime(startTime);
-        var chunkGranule = chunkTime[0] * 48000 + ~~(chunkTime[1] / 20833.333);
-
+    // Function to encode a single Opus chunk to the ogg file (exists only to work around an error)
+    function encodeChunk(oggStream, chunkGranule, streamNo, packetNo, chunk) {
         if (chunk.length > 4 && chunk[0] === 0xBE && chunk[1] === 0xDE) {
             // There's an RTP header extension here. Strip it.
             var rtpHLen = chunk.readUInt16BE(2);
@@ -332,42 +336,39 @@ function session(msg, prefix, rec) {
     }
 
     // And receiver for the actual data
-    function onReceive(user, chunk) {
-        if (user.id in userOpusStreams) return;
-
-        var opusStream = userOpusStreams[user.id] = receiver.createOpusStream(user);
+    function onReceive(chunk, userId, timestamp) {
+        chunk = Buffer.from(chunk);
         var userTrackNo, packetNo;
-        if (!(user.id in userTrackNos)) {
+        if (!(userId in userTrackNos)) {
             userTrackNo = trackNo++;
-            userTrackNos[user.id] = userTrackNo;
-            packetNo = userPacketNos[user.id] = 0;
+            userTrackNos[userId] = userTrackNo;
+            packetNo = 2;
+            userPacketNos[userId] = 3;
 
             // Put a valid Opus header at the beginning
             try {
                 write(recOggHStream[0], 0, userTrackNo, 0, opusHeader[0], ogg.BOS);
-                write(recOggHStream[1], 0, userTrackNo, 0, opusHeader[1]);
+                write(recOggHStream[1], 0, userTrackNo, 1, opusHeader[1]);
             } catch (ex) {}
         } else {
-            userTrackNo = userTrackNos[user.id];
-            packetNo = userPacketNos[user.id];
+            userTrackNo = userTrackNos[userId];
+            packetNo = userPacketNos[userId]++;
         }
 
         try {
-            encodeChunk(recOggStream, userTrackNo, packetNo++, chunk);
-            userPacketNos[user.id] = packetNo;
-        } catch (ex) {}
-
-        opusStream.on("data", (chunk) => {
-            try {
-                encodeChunk(recOggStream, userTrackNo, packetNo++, chunk);
-                userPacketNos[user.id] = packetNo;
-            } catch (ex) {}
-        });
-        opusStream.on("end", () => {
-            delete userOpusStreams[user.id];
-        });
+            encodeChunk(recOggStream, timestamp - startTime, userTrackNo, packetNo, chunk);
+        } catch (ex) {
+            console.error(ex);
+        }
     }
-    receiver.on("opus", onReceive);
+
+    // Receiver for the first packet, to get the start time
+    function firstReceive(chunk, userId, timestamp) {
+        startTime = timestamp - 960 /* one packet */;
+        receiver.on("data", onReceive);
+        onReceive(chunk, userId, timestamp);
+    }
+    receiver.once("data", firstReceive);
 
     // When we're disconnected from the channel...
     function onDisconnect() {
@@ -396,11 +397,6 @@ function session(msg, prefix, rec) {
         // Delete our leave timeout
         clearTimeout(partTimeout);
 
-        // Destroy the receiver
-        try {
-            receiver.destroy();
-        } catch (ex) {}
-
         // And callback
         rec.close();
     }
@@ -414,7 +410,7 @@ client.on("ready", () => {
     log("Logged in as " + client.user.username);
     craigCommand = new RegExp("^(:craig:|<:craig:[0-9]*>|<@!?" + client.user.id + ">)[, ]*([^ ]*) ?(.*)$");
     if ("url" in config)
-        client.user.setPresence({game: {name: config.url, type: 0}}).catch(()=>{});
+        client.editStatus("online", {name: config.url, url: config.url});
 });
 
 // Only admins and those with the Craig role are authorized to use Craig
@@ -422,11 +418,14 @@ function userIsAuthorized(member) {
     if (!member) return false;
 
     // Guild owners are always allowed
-    if (member.hasPermission("MANAGE_GUILD"))
+    if (member.permission.has("manageGuild"))
         return true;
 
     // Otherwise, they must be a member of the right role
-    if (member.roles.some((role) => { return role.name.toLowerCase() === "craig"; }))
+    var guild = member.guild;
+    if (!guild) return false;
+    var roles = guild.roles;
+    if (member.roles.find((role) => { return roles.get(role).name.toLowerCase() === "craig"; }))
         return true;
 
     // Not for you!
@@ -560,7 +559,7 @@ function onMessage(msg) {
     if (cmd === null) return;
 
     // Is this from our glorious leader?
-    if (msg.channel.type === "dm" && msg.author.id && msg.author.id === config.owner) {
+    if (msg.channel.type === DM_CHANNEL && msg.author.id === config.owner) {
         ownerCommand(msg, cmd);
         return;
     }
@@ -575,7 +574,7 @@ function onMessage(msg) {
 
     // Keep this guild alive
     try {
-        guildRefresh(msg.guild);
+        guildRefresh(msg.channel.guild);
     } catch (ex) {}
 
     var op = cmd[2].toLowerCase();
@@ -586,18 +585,18 @@ function onMessage(msg) {
 
     fun(msg, cmd);
 }
-client.on("message", onMessage);
+client.on("messageCreate", onMessage);
 
 // Find a channel matching the given name
 function findChannel(msg, guild, cname) {
     var channel = null;
 
-    guild.channels.some((schannel) => {
-        if (schannel.type !== "voice")
+    guild.channels.find((schannel) => {
+        if (schannel.type !== VOICE_CHANNEL)
             return false;
 
         if (schannel.name.toLowerCase() === cname ||
-            (cname === "" && msg.member.voiceChannel === schannel)) {
+            (cname === "" && msg.member.voiceState.channelID === schannel.id)) {
             channel = schannel;
             return true;
 
@@ -614,7 +613,7 @@ function findChannel(msg, guild, cname) {
 
 // Start recording
 commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
-    var guild = msg.guild;
+    var guild = msg.channel.guild;
     if (!guild)
         return;
     var cname = cmd[3].toLowerCase();
@@ -655,12 +654,8 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
                 channel = guild.channels.get(channelId);
         }
 
-        // Joinable can crash if the voiceConnection is in a weird state
-        var joinable = false;
-        try {
-            if (channel)
-                joinable = channel.joinable;
-        } catch (ex) {}
+        // FIXME: Make the joinable check work with Eris
+        var joinable = true;
 
         // Choose the right action
         if (channelId in activeRecordings[guildId]) {
@@ -722,7 +717,7 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
                 /* The only way to reliably make sure we leave
                  * the channel is to join it, then leave it */
                 try { channel.leave(); } catch (ex) {}
-                channel.join()
+                channel.join({opusOnly: true})
                     .then(() => { channel.leave(); })
                     .catch(() => {});
 
@@ -734,11 +729,12 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
 
                 // Rename the bot in this guild
                 try {
-                    guild.members.get(chosenClient.user.id).setNickname(reNick).catch(() => {});
+                    guild.editNickname(reNick).catch(() => {});
                 } catch (ex) {}
             }
 
             var rec = {
+                guild: guild,
                 connection: null,
                 id: id,
                 accessKey: accessKey,
@@ -780,15 +776,14 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
 
 // Stop recording
 commands["leave"] = commands["part"] = function(msg, cmd) {
-    var guild = msg.guild;
-    if (!msg.guild)
+    var guild = msg.channel.guild;
+    if (!guild)
         return;
     var cname = cmd[3].toLowerCase();
 
     var channel = findChannel(msg, guild, cname);
 
     if (channel !== null) {
-        var guild = msg.guild;
         var guildId = guild.id;
         var channelId = channel.id;
         if (!(guildId in activeRecordings) ||
@@ -823,7 +818,7 @@ commands["leave"] = commands["part"] = function(msg, cmd) {
 
 // Stop all recordings
 commands["stop"] = function(msg, cmd) {
-    var guild = msg.guild;
+    var guild = msg.channel.guild;
     if (!guild)
         return;
     var guildId = guild.id;
@@ -851,58 +846,54 @@ commands["help"] = commands["commands"] = commands["hello"] = commands["info"] =
 
 // Checks for catastrophic recording errors
 clients.forEach((client) => {
-    client.on("voiceStateUpdate", (from, to) => {
+    client.on("voiceChannelSwitch", (member, to, from) => {
         try {
-            if (from.id === client.user.id) {
-                var guildId = from.guild.id;
-                var channelId = from.voiceChannel.id;
+            if (member.id === client.user.id) {
+                var guildId = member.guild.id;
+                var channelId = from.id;
                 if (guildId in activeRecordings &&
                     channelId in activeRecordings[guildId] &&
-                    from.voiceChannelID !== to.voiceChannelId) {
+                    from !== to) {
                     // We do not tolerate being moved
                     log("Terminating recording: Moved to a different channel.");
-                    to.guild.voiceConnection.disconnect();
+                    activeRecordings[guildId][channelId].connection.disconnect();
                 }
             }
         } catch (err) {}
     });
 
-    client.on("guildUpdate", (from, to) => {
+    client.on("guildUpdate", (to, from) => {
         try {
-            if (from.region !== to.region) {
+            if (to.id in activeRecordings && from.region !== to.region) {
                 // The server has moved regions. This breaks recording.
                 log("Terminating recording: Moved to a different voice region.");
-                to.voiceConnection.disconnect();
+                var g = activeRecordings[to.id];
+                for (var cid in g) {
+                    var c = g[cid];
+                    if (c.client === client)
+                        c.connection.disconnect();
+                }
             }
         } catch (err) {}
     });
 
-    client.on("guildMemberUpdate", (from, to) => {
+    client.on("guildMemberUpdate", (guild, to, from) => {
         try {
-            if (from.id === client.user.id &&
-                from.nickname !== to.nickname &&
-                to.guild.voiceConnection &&
-                to.nickname.indexOf("[RECORDING]") === -1) {
+            if (to.id === client.user.id &&
+                from.nick !== to.nick &&
+                guild.id in activeRecordings &&
+                to.nick.indexOf("[RECORDING]") === -1) {
                 // They attempted to hide the fact that Craig is recording. Not acceptable.
                 log("Terminating recording: Nick changed wrongly.");
-                to.guild.voiceConnection.disconnect();
+                var g = activeRecordings[guild.id];
+                for (var cid in g) {
+                    var c = g[cid];
+                    if (c.client === client)
+                        c.connection.disconnect();
+                }
             }
         } catch (err) {}
     });
-});
-
-// Reconnect when we disconnect
-var reconnectTimeout = null;
-client.on("disconnect", () => {
-    if (reconnectTimeout !== null) {
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
-    }
-    reconnectTimeout = setTimeout(() => {
-        if (client.status !== 0)
-            client.login(config.token).catch(()=>{});
-        reconnectTimeout = null;
-    }, 10000);
 });
 
 /***************************************************************
@@ -926,16 +917,16 @@ setInterval(() => {
 
     for (var ci = 0; ci < clients.length; ci++) {
         client = clients[ci];
-        client.guilds.every((guild) => {
+        client.guilds.forEach((guild) => {
             if (!(guild.id in guildMembershipStatus)) {
                 guildRefresh(guild);
-                return true;
+                return;
             }
 
             if (guildMembershipStatus[guild.id] + config.guildMembershipTimeout < (new Date().getTime())) {
                 if (guild.id in importantServers) {
                     guildRefresh(guild);
-                    return true;
+                    return;
                 }
 
                 // Time's up!
@@ -950,7 +941,7 @@ setInterval(() => {
                 guildMembershipStatusF.write("," + JSON.stringify(step) + "\n");
             }
 
-            return true;
+            return;
         });
     }
 
@@ -1021,7 +1012,7 @@ if (config.stats) {
                 if (newChannels)
                     topic += " Currently recording " + newUsers + " users in " + newChannels + " voice channels.";
                 if (users != newUsers || channels != newChannels) {
-                    channel.setTopic(topic);
+                    channel.edit({topic:topic}).catch(()=>{});
                     users = newUsers;
                     channels = newChannels;
                 }
@@ -1039,7 +1030,7 @@ if (config.stats) {
             if (dead)
                 return;
 
-            if (!msg.guild || msg.guild.id !== config.stats.guild || statsCp)
+            if (!msg.channel.guild || msg.channel.guild.id !== config.stats.guild || statsCp)
                 return;
 
             var statsOut = "";
@@ -1053,7 +1044,9 @@ if (config.stats) {
                 statsOut += chunk.toString("utf8");
             });
             statsCp.stdout.on("end", () => {
-                msg.reply("\n" + statsOut);
+                msg.channel.createMessage(
+                    msg.author.mention + ", \n" +
+                    statsOut).catch(()=>{});
             });
         }
     })();

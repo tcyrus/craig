@@ -8,10 +8,6 @@
     },
     "dependencies": {
         "cyclic-32": "*",
-        "discord.js": "^11.3.0",
-        "erlpack": "hammerandchisel/erlpack",
-        "node-opus": "*",
-        "sodium": "*",
-        "uws": "^0.14.5"
+        "eris": "*"
     }
 }
