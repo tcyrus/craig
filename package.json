@@ -8,6 +8,11 @@
     },
     "dependencies": {
         "cyclic-32": "*",
-        "eris": "*"
+        "eris": "*",
+        "bufferutil": "*",
+        "erlpack": "abalabahaha/erlpack",
+        "eventemitter3": "*",
+        "zlib-sync": "*",
+        "uws": "*"
     }
 }
