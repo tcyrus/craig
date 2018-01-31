@@ -287,7 +287,7 @@ function session(msg, prefix, rec) {
     var trackNo = 1;
 
     // Set up our recording OGG header and data file
-    var startTime = 0;
+    var startTime = process.hrtime();
     var recFileBase = "rec/" + id + ".ogg";
 
     // Set up our recording streams
@@ -314,7 +314,10 @@ function session(msg, prefix, rec) {
     var recOggStream = new ogg.OggEncoder(recFStream);
 
     // Function to encode a single Opus chunk to the ogg file (exists only to work around an error)
-    function encodeChunk(oggStream, chunkGranule, streamNo, packetNo, chunk) {
+    function encodeChunk(oggStream, streamNo, packetNo, chunk) {
+        var chunkTime = process.hrtime(startTime);
+        var chunkGranule = chunkTime[0] * 48000 + ~~(chunkTime[1] / 20833.333);
+
         if (chunk.length > 4 && chunk[0] === 0xBE && chunk[1] === 0xDE) {
             // There's an RTP header extension here. Strip it.
             var rtpHLen = chunk.readUInt16BE(2);
@@ -336,7 +339,11 @@ function session(msg, prefix, rec) {
     }
 
     // And receiver for the actual data
-    function onReceive(chunk, userId, timestamp) {
+    function onReceive(chunk, userId) {
+        /* Note: We don't use the timestamp because it's different per speaker,
+         * and different speakers may have uncoordinated clocks. We stick to
+         * only our own, trusted clock. In the future, it may be worthwhile to
+         * use a little bit of both. */
         chunk = Buffer.from(chunk);
         var userTrackNo, packetNo;
         if (!(userId in userTrackNos)) {
@@ -356,19 +363,13 @@ function session(msg, prefix, rec) {
         }
 
         try {
-            encodeChunk(recOggStream, timestamp - startTime, userTrackNo, packetNo, chunk);
+            encodeChunk(recOggStream, userTrackNo, packetNo, chunk);
         } catch (ex) {
             console.error(ex);
         }
     }
 
-    // Receiver for the first packet, to get the start time
-    function firstReceive(chunk, userId, timestamp) {
-        startTime = timestamp - 960 /* one packet */;
-        receiver.on("data", onReceive);
-        onReceive(chunk, userId, timestamp);
-    }
-    receiver.once("data", firstReceive);
+    receiver.on("data", onReceive);
 
     // When we're disconnected from the channel...
     function onDisconnect() {
