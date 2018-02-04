@@ -436,6 +436,11 @@ function session(msg, prefix, rec) {
         clearTimeout(partTimeout);
         clearInterval(useInterval);
 
+        // Delete the voice connection (working around an Eris bug)
+        try {
+            rec.chosenClient.voiceConnections.delete(guild.id);
+        } catch (ex) {}
+
         // And callback
         rec.close();
     }
