@@ -26,14 +26,15 @@ const TEXT_CHANNEL = 0;
 const DM_CHANNEL = 1;
 const VOICE_CHANNEL = 2;
 
-const client = new Discord(config.token);
-const clients = [client]; // For secondary connections
 const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
 const defaultConfig = require("./default-config.js");
 
 for (var ck in defaultConfig)
     if (!(ck in config))
         config[ck] = defaultConfig[ck];
+
+const client = new Discord(config.token);
+const clients = [client]; // For secondary connections
 
 function accessSyncer(file) {
     try {
@@ -438,7 +439,7 @@ function session(msg, prefix, rec) {
 
         // Delete the voice connection (working around an Eris bug)
         try {
-            rec.chosenClient.voiceConnections.delete(guild.id);
+            rec.client.voiceConnections.delete(guild.id);
         } catch (ex) {}
 
         // And callback
