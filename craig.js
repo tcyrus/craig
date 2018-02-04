@@ -21,29 +21,19 @@ const https = require("https");
 const Discord = require("eris");
 const ogg = require("./craig-ogg.js");
 
-const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
-const client = new Discord(config.token);
-const clients = [client]; // For secondary connections
-
 // Are these constants SERIOUSLY not exposed by Eris at all???
 const TEXT_CHANNEL = 0;
 const DM_CHANNEL = 1;
 const VOICE_CHANNEL = 2;
 
-if (!("nick" in config))
-    config.nick = "Craig";
-if (!("longUrl" in config))
-    config.longUrl = "https://craigrecords.yahweasel.com/home/";
-if (!("dlUrl" in config))
-    config.dlUrl = "https://craigrecords.yahweasel.com/";
-if (!("hardLimit" in config))
-    config.hardLimit = 536870912;
-if (!("guildMembershipTimeout" in config))
-    config.guildMembershipTimeout = 604800000;
-if (!("secondary" in config))
-    config.secondary = [];
-if (!("importantServers" in config))
-    config.importantServers = [];
+const client = new Discord(config.token);
+const clients = [client]; // For secondary connections
+const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
+const defaultConfig = require("./default-config.js");
+
+for (var ck in defaultConfig)
+    if (!(ck in config))
+        config[ck] = defaultConfig[ck];
 
 function accessSyncer(file) {
     try {
@@ -127,6 +117,10 @@ var dead = false;
 
 // Active recordings by guild, channel
 var activeRecordings = {};
+
+// A map user ID -> rewards
+var rewards = {};
+var defaultFeatures = {"limits": config.limits};
 
 // Function to respond to a message by any means necessary
 function reply(msg, dm, prefix, pubtext, privtext) {
@@ -221,7 +215,7 @@ if (process.channel) {
                                 connection: {
                                     channel: {
                                         members: {
-                                            size: 1
+                                            size: (nc.size?nc.size:1)
                                         }
                                     },
                                     disconnect: function() {
@@ -245,10 +239,18 @@ if (process.channel) {
     });
 }
 
+// Get the features for a given user
+function features(id) {
+    var r = rewards[id];
+    if (r) return r;
+    return defaultFeatures;
+}
+
 // Our recording session proper
 function session(msg, prefix, rec) {
     var guild = rec.guild;
     var connection = rec.connection;
+    var limits = rec.limits;
     var id = rec.id;
     var client = rec.client;
     var nick = rec.nick;
@@ -265,7 +267,7 @@ function session(msg, prefix, rec) {
         sReply(true, "Sorry, but you've hit the recording time limit. Recording stopped.");
         rec.disconnected = true;
         connection.disconnect();
-    }, 1000*60*60*6);
+    }, limits.record * 60*60*1000);
 
     // Rename ourself to indicate that we're recording
     try {
@@ -296,6 +298,36 @@ function session(msg, prefix, rec) {
     var startTime = process.hrtime();
     var recFileBase = "rec/" + id + ".ogg";
 
+    // The amount of data I've recorded
+    var size = 0;
+
+    // Keep track and disconnect if we seem unused
+    var lastSize = 0;
+    var usedMinutes = 0;
+    var unusedMinutes = 0;
+    var warned = false;
+    const useInterval = setInterval(() => {
+        if (size != lastSize) {
+            lastSize = size;
+            usedMinutes++;
+            unusedMinutes = 0;
+        } else {
+            unusedMinutes++;
+            if (usedMinutes === 0) {
+                // No recording at all!
+                log("Terminating " + id + ": No data.");
+                sReply(true, "I'm not receiving any data! Disconnecting.");
+                rec.disconnected = true;
+                connection.disconnect();
+                return;
+            } else if (unusedMinutes === 5 && !warned) {
+                sReply(true, "Hello? I haven't heard anything for five minutes. Has something gone wrong, are you just taking a break, or have you forgotten to `:craig:, leave` to stop the recording? If it's just a break, disregard this message!");
+                sReply(false, "Hello? I haven't heard anything for five minutes. Has something gone wrong, are you just taking a break, or have you forgotten to `:craig:, leave` to stop the recording? If it's just a break, disregard this message!");
+                warned = true;
+            }
+        }
+    }, 60000);
+
     // Set up our recording streams
     var recFHStream = [
         fs.createWriteStream(recFileBase + ".header1"),
@@ -304,7 +336,6 @@ function session(msg, prefix, rec) {
     var recFStream = fs.createWriteStream(recFileBase + ".data");
 
     // And our ogg encoders
-    var size = 0;
     function write(stream, granulePos, streamNo, packetNo, chunk, flags) {
         size += chunk.length;
         if (config.hardLimit && size >= config.hardLimit) {
@@ -403,6 +434,7 @@ function session(msg, prefix, rec) {
 
         // Delete our leave timeout
         clearTimeout(partTimeout);
+        clearInterval(useInterval);
 
         // And callback
         rec.close();
@@ -449,9 +481,14 @@ function gracefulRestart() {
             var ng = nar[gid] = {};
             for (var cid in g) {
                 var c = g[cid];
+                var size = 1;
+                try {
+                    size = c.connection.channel.members.size;
+                } catch (ex) {}
                 var nc = ng[cid] = {
                     id: c.id,
-                    accessKey: c.accessKey
+                    accessKey: c.accessKey,
+                    size: size
                 };
             }
         }
@@ -461,9 +498,6 @@ function gracefulRestart() {
 
         // And then exit when we're done
         function maybeQuit(rec) {
-            if (Object.keys(activeRecordings).length > 1)
-                return;
-
             for (var gid in activeRecordings) {
                 var g = activeRecordings[gid];
                 for (var cid in g) {
@@ -497,7 +531,7 @@ function gracefulRestart() {
 }
 
 // Memory leaks (yay) force us to gracefully restart every so often
-var uptimeTimeout = setTimeout(gracefulRestart, 24*60*60*1000);
+var uptimeTimeout = setTimeout(() => { if (!dead) gracefulRestart(); }, 24*60*60*1000);
 
 // Special commands from the owner
 function ownerCommand(msg, cmd) {
@@ -618,6 +652,31 @@ function findChannel(msg, guild, cname) {
     return channel;
 }
 
+// Join a voice channel, working around discord.js' knot of insane bugs
+function safeJoin(channel, err) {
+    var guild = channel.guild;
+    var insaneInterval;
+
+    function catchConnection() {
+        if (guild.voiceConnection) {
+            guild.voiceConnection.on("error", (ex) => {
+                // Work around the hellscape of discord.js bugs
+                try {
+                    guild.client.voice.connections.delete(guild.id);
+                } catch (noex) {}
+                if (err)
+                    err(ex);
+            });
+            clearInterval(insaneInterval);
+        }
+    }
+
+    var ret = channel.join();
+    var insaneInterval = setInterval(catchConnection, 200);
+
+    return ret;
+}
+
 // Start recording
 commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
     var guild = msg.channel.guild;
@@ -687,6 +746,9 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
             reply(msg, false, cmd[1], "I don't have permission to join that channel!");
 
         } else {
+            // Figure out the recording features for this user
+            var f = features(msg.author.id);
+
             // Make a random ID for it
             var id;
             do {
@@ -702,12 +764,17 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
             var deleteKey = ~~(Math.random() * 1000000000);
             fs.writeFileSync(recFileBase + ".delete", ""+deleteKey, "utf8");
 
+            // If the user has features, mark them down
+            if (f !== defaultFeatures)
+                fs.writeFileSync(recFileBase + ".features", JSON.stringify(f), "utf8");
+
             // Make sure they get destroyed
-            var atcp = cp.spawn("at", ["now + 48 hours"],
+            var atcp = cp.spawn("at", ["now + " + f.limits.download + " hours"],
                     {"stdio": ["pipe", 1, 2]});
             atcp.stdin.write("rm -f " + recFileBase + ".header1 " +
                     recFileBase + ".header2 " + recFileBase + ".data " +
-                    recFileBase + ".key " + recFileBase + ".delete\n");
+                    recFileBase + ".key " + recFileBase + ".delete " +
+                    recFileBase + ".features\n");
             atcp.stdin.end();
 
             // We have a nick per the specific client
@@ -721,13 +788,6 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
                     return;
                 closed = true;
 
-                /* The only way to reliably make sure we leave
-                 * the channel is to join it, then leave it */
-                try { channel.leave(); } catch (ex) {}
-                channel.join({opusOnly: true})
-                    .then(() => { channel.leave(); })
-                    .catch(() => {});
-
                 // Now get rid of it
                 delete activeRecordings[guildId][channelId];
                 if (Object.keys(activeRecordings[guildId]).length === 0) {
@@ -738,6 +798,31 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
                 try {
                     guild.editNickname(reNick).catch(() => {});
                 } catch (ex) {}
+
+                // Try to reset our voice connection nonsense by joining a different channel
+                var diffChannel = channel;
+                guild.channels.some((maybeChannel) => {
+                    if (maybeChannel === channel)
+                        return false;
+
+                    var joinable = false;
+                    try {
+                        joinable = maybeChannel.joinable;
+                    } catch (ex) {}
+                    if (!joinable)
+                        return false;
+
+                    diffChannel = maybeChannel;
+                    return true;
+                });
+                function leave() {
+                    setTimeout(()=>{
+                        try {
+                            diffChannel.leave();
+                        } catch (ex) {}
+                    }, 1000);
+                }
+                safeJoin(diffChannel, leave).then(leave).catch(leave);
             }
 
             var rec = {
@@ -747,31 +832,33 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
                 accessKey: accessKey,
                 client: chosenClient,
                 clientNum: chosenClientNum,
+                limits: f.limits,
                 nick: reNick,
                 disconnected: false,
                 close: close
             };
             activeRecordings[guildId][channelId] = rec;
 
+            // If we have voice channel issue, do our best to rectify them
+            function onError(ex) {
+                reply(msg, false, cmd[1], "Failed to join! " + ex);
+                close();
+            }
+
             // Join the channel
-            try {
-                channel.leave();
-            } catch (ex) {}
-            channel.join().then((connection) => {
+            safeJoin(channel, onError).then((connection) => {
                 // Tell them
                 reply(msg, true, cmd[1],
-                    "Recording! I will record up to six hours. Recordings are deleted automatically after 48 hours from the start of recording. The audio can be downloaded even while I'm still recording.\n\n" +
+                    "Recording! I will record up to " + f.limits.record +
+                    " hours. Recordings are deleted automatically after " + f.limits.download +
+                    " hours from the start of recording. The audio can be downloaded even while I'm still recording.\n\n" +
                     "Download link: " + config.dlUrl + "?id=" + id + "&key=" + accessKey,
                     "To delete: " + config.dlUrl + "?id=" + id + "&key=" + accessKey + "&delete=" + deleteKey + "\n.");
 
                 rec.connection = connection;
 
                 session(msg, cmd[1], rec);
-            }).catch((ex) => {
-                reply(msg, false, cmd[1], "Failed to join! " + ex);
-                close();
-            });
-
+            }).catch(onError);
         }
 
     } else if (!dead) {
@@ -845,8 +932,31 @@ commands["stop"] = function(msg, cmd) {
 
 }
 
+// Tell the user their features
+commands["features"] = function(msg, cmd) {
+    if (dead) return;
+
+    var f = features(msg.author.id);
+    
+    var ret = "\n";
+    if (f === defaultFeatures)
+        ret += "Default features:";
+    else
+        ret += "For you:";
+    ret += "\nRecording time limit: " + f.limits.record + " hours" +
+           "\nDownload time limit: " + f.limits.download + " hours";
+
+    if (f.mix)
+        ret += "\nYou may download auto-leveled mixed audio.";
+    if (f.mp3)
+        ret += "\nYou may download MP3.";
+
+    reply(msg, false, false, ret);
+}
+
 // And finally, help commands
 commands["help"] = commands["commands"] = commands["hello"] = commands["info"] = function(msg, cmd) {
+    if (dead) return;
     reply(msg, false, cmd[1],
         "Hello! I'm Craig! I'm a multi-track voice channel recorder. For more information, see " + config.longUrl + " ");
 }
@@ -1058,3 +1168,54 @@ if (config.stats) {
         }
     })();
 }
+
+// Use server roles to give rewards
+if (config.rewards) (function() {
+    function resolveRewards(member) {
+        var rr = config.rewards.roles;
+        var mrewards = {};
+
+        member.roles.forEach((role) => {
+            var rn = role.name.toLowerCase();
+            if (rn in rr) {
+                var roler = rr[rn];
+                for (var rid in roler) {
+                    if (rid !== "limits") mrewards[rid] = roler[rid];
+                }
+                if (roler.limits) {
+                    if (!mrewards.limits) mrewards.limits = {record: config.limits.record, download: config.limits.download};
+                    if (roler.limits.record > mrewards.limits.record)
+                        mrewards.limits.record = roler.limits.record;
+                    if (roler.limits.download > mrewards.limits.download)
+                        mrewards.limits.download = roler.limits.download;
+                }
+            }
+        });
+
+        if (Object.keys(mrewards).length)
+            rewards[member.id] = mrewards;
+        else
+            delete rewards[member.id];
+    }
+
+    // Get our initial rewards on connection
+    client.on("ready", () => {
+        var rr = config.rewards.roles;
+        var guild = client.guilds.get(config.rewards.guild);
+        if (!guild) return;
+        guild.fetchMembers().then((guild) => {
+            guild.roles.forEach((role) => {
+                var rn = role.name.toLowerCase();
+                if (rn in rr)
+                    role.members.forEach(resolveRewards);
+            });
+        });
+    });
+
+    // Reresolve a member when their roles change
+    client.on("guildMemberUpdate", (from, to) => {
+        if (to.guild.id !== config.rewards.guild) return;
+        if (from.roles === to.roles) return;
+        resolveRewards(to);
+    });
+})();
