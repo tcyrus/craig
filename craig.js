@@ -658,31 +658,6 @@ function findChannel(msg, guild, cname) {
     return channel;
 }
 
-// Join a voice channel, working around discord.js' knot of insane bugs
-function safeJoin(channel, err) {
-    var guild = channel.guild;
-    var insaneInterval;
-
-    function catchConnection() {
-        if (guild.voiceConnection) {
-            guild.voiceConnection.on("error", (ex) => {
-                // Work around the hellscape of discord.js bugs
-                try {
-                    guild.client.voice.connections.delete(guild.id);
-                } catch (noex) {}
-                if (err)
-                    err(ex);
-            });
-            clearInterval(insaneInterval);
-        }
-    }
-
-    var ret = channel.join();
-    var insaneInterval = setInterval(catchConnection, 200);
-
-    return ret;
-}
-
 // Start recording
 commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
     var guild = msg.channel.guild;
@@ -804,31 +779,6 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
                 try {
                     guild.editNickname(reNick).catch(() => {});
                 } catch (ex) {}
-
-                // Try to reset our voice connection nonsense by joining a different channel
-                var diffChannel = channel;
-                guild.channels.some((maybeChannel) => {
-                    if (maybeChannel === channel)
-                        return false;
-
-                    var joinable = false;
-                    try {
-                        joinable = maybeChannel.joinable;
-                    } catch (ex) {}
-                    if (!joinable)
-                        return false;
-
-                    diffChannel = maybeChannel;
-                    return true;
-                });
-                function leave() {
-                    setTimeout(()=>{
-                        try {
-                            diffChannel.leave();
-                        } catch (ex) {}
-                    }, 1000);
-                }
-                safeJoin(diffChannel, leave).then(leave).catch(leave);
             }
 
             var rec = {
@@ -852,7 +802,7 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
             }
 
             // Join the channel
-            safeJoin(channel, onError).then((connection) => {
+            channel.join({opusOnly:true}).then((connection) => {
                 // Tell them
                 reply(msg, true, cmd[1],
                     "Recording! I will record up to " + f.limits.record +
