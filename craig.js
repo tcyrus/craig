@@ -123,6 +123,10 @@ var activeRecordings = {};
 var rewards = {};
 var defaultFeatures = {"limits": config.limits};
 
+// A map of users with rewards -> blessed guilds and vice-versa
+var blessU2G = {};
+var blessG2U = {};
+
 // Function to respond to a message by any means necessary
 function reply(msg, dm, prefix, pubtext, privtext) {
     if (dm) {
@@ -241,15 +245,24 @@ if (process.channel) {
 }
 
 // Get the features for a given user
-function features(id) {
+function features(id, gid) {
+    // Do they have their own rewards?
     var r = rewards[id];
     if (r) return r;
+
+    // Are they in a blessed guild?
+    if (gid && gid in blessG2U) {
+        r = rewards[blessG2U[gid]];
+        if (r) return r;
+    }
+
     return defaultFeatures;
 }
 
 // Our recording session proper
 function session(msg, prefix, rec) {
     var guild = rec.guild;
+    var channel = rec.channel;
     var connection = rec.connection;
     var limits = rec.limits;
     var id = rec.id;
@@ -282,7 +295,7 @@ function session(msg, prefix, rec) {
 
     // Log it
     try {
-        log("Started recording " + nameId(connection.channel) + "@" + nameId(connection.channel.guild) + " with ID " + id);
+        log("Started recording " + nameId(channel) + "@" + nameId(guild) + " with ID " + id);
     } catch(ex) {}
     recordingEvents.emit("start", rec);
 
@@ -414,7 +427,7 @@ function session(msg, prefix, rec) {
         if (!rec.disconnected) {
             // Not an intentional disconnect
             try {
-                log("Unexpected disconnect from " + nameId(connection.channel) + "@" + nameId(connection.channel.guild) + " with ID " + id);
+                log("Unexpected disconnect from " + nameId(channel) + "@" + nameId(guild) + " with ID " + id);
             } catch (ex) {}
             try {
                 sReply(true, "I've been unexpectedly disconnected! If you want me to stop recording, please command me to with :craig:, stop.");
@@ -424,7 +437,7 @@ function session(msg, prefix, rec) {
 
         // Log it
         try {
-            log("Finished recording " + nameId(connection.channel) + "@" + nameId(connection.channel.guild) + " with ID " + id);
+            log("Finished recording " + nameId(channel) + "@" + nameId(guild) + " with ID " + id);
         } catch (ex) {}
         recordingEvents.emit("stop", rec);
 
@@ -489,7 +502,7 @@ function gracefulRestart() {
                 var c = g[cid];
                 var size = 1;
                 try {
-                    size = c.connection.channel.members.size;
+                    size = c.channel.voiceMembers.size;
                 } catch (ex) {}
                 var nc = ng[cid] = {
                     id: c.id,
@@ -728,7 +741,7 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
 
         } else {
             // Figure out the recording features for this user
-            var f = features(msg.author.id);
+            var f = features(msg.author.id, guildId);
 
             // Make a random ID for it
             var id;
@@ -783,6 +796,7 @@ commands["join"] = commands["record"] = commands["rec"] = function(msg, cmd) {
 
             var rec = {
                 guild: guild,
+                channel: channel,
                 connection: null,
                 id: id,
                 accessKey: accessKey,
@@ -888,25 +902,39 @@ commands["stop"] = function(msg, cmd) {
 
 }
 
-// Tell the user their features
-commands["features"] = function(msg, cmd) {
-    if (dead) return;
-
-    var f = features(msg.author.id);
-    
+// Turn features into a string
+function featuresToStr(f, guild, prefix) {
     var ret = "\n";
     if (f === defaultFeatures)
         ret += "Default features:";
     else
-        ret += "For you:";
+        ret += prefix + ":";
     ret += "\nRecording time limit: " + f.limits.record + " hours" +
            "\nDownload time limit: " + f.limits.download + " hours";
 
     if (f.mix)
         ret += "\nYou may download auto-leveled mixed audio.";
+    if (f.auto)
+        ret += "\nYou may autorecord channels.";
+    if (f.bless && !guild)
+        ret += "\nYou may bless servers.";
     if (f.mp3)
         ret += "\nYou may download MP3.";
 
+    return ret;
+}
+
+// Tell the user their features
+commands["features"] = function(msg, cmd) {
+    if (dead) return;
+
+    var f = features(msg.author.id);
+    var gf = features(msg.author.id, msg.guild ? msg.guild.id : undefined);
+
+    var ret = featuresToStr(f, false, "For you");
+    if (gf !== f)
+        ret += "\n" + featuresToStr(gf, true, "For this server");
+   
     reply(msg, false, false, ret);
 }
 
@@ -1074,7 +1102,7 @@ if (config.stats) {
                             continue;
                         if (rec.connection) {
                             try {
-                                newUsers += rec.connection.channel.members.size - 1;
+                                newUsers += rec.channel.voiceMembers.size - 1;
                                 newChannels++;
                             } catch (ex) {}
                         }
@@ -1127,6 +1155,19 @@ if (config.stats) {
 
 // Use server roles to give rewards
 if (config.rewards) (function() {
+    // Journal of blesses
+    var blessJournalF = null;
+
+    // Association of users with arrays autorecord guild+channels
+    var autoU2GC = {};
+
+    // And guilds to user+channel
+    var autoG2UC = {};
+
+    // And the journal of autorecord changes
+    var autoJournalF = null;
+
+    // Resolve a user's rewards by their role
     function resolveRewards(member) {
         var rr = config.rewards.roles;
         var mrewards = {};
@@ -1152,6 +1193,94 @@ if (config.rewards) (function() {
             rewards[member.id] = mrewards;
         else
             delete rewards[member.id];
+        return mrewards;
+    }
+
+    // Remove a bless
+    function removeBless(uid) {
+        if (uid in blessU2G) {
+            var gid = blessU2G[uid];
+            var step = {u:uid};
+            delete blessU2G[uid];
+            delete blessG2U[gid];
+            if (!dead && blessJournalF)
+                blessJournalF.write("," + JSON.stringify(step) + "\n");
+        }
+    }
+
+    // Add a bless
+    function addBless(uid, gid) {
+        if (uid in blessU2G)
+            removeBless(uid);
+
+        var step = {u:uid, g:gid};
+        blessU2G[uid] = gid;
+        blessG2U[gid] = uid;
+        if (!dead && blessJournalF)
+            blessJournalF.write("," + JSON.stringify(step) + "\n");
+    }
+
+    // Resolve blesses from U2G into G2U, asserting that the relevant uids actually have bless powers
+    function resolveBlesses() {
+        blessG2U = {};
+        Object.keys(blessU2G).forEach((uid) => {
+            var f = features(uid);
+            if (f.bless)
+                blessG2U[blessU2G[uid]] = uid;
+            else
+                delete blessU2G[uid];
+        });
+    }
+
+    // Remove a user's autorecord
+    function removeAutorecord(uid, gid) {
+        if (uid in autoU2GC) {
+            var gcs = autoU2GC[uid];
+            for (var gci = 0; gci < gcs.length; gci++) {
+                var gc = gcs[gci];
+                if (gc.g !== gid) continue;
+
+                // Found the one to remove
+                gcs.splice(gci, 1);
+
+                var step = {u:uid, g:gid};
+                if (gcs.length === 0)
+                    delete autoU2GC[uid];
+                delete autoG2UC[gid];
+                if (!dead && autoJournalF)
+                    autoJournalF.write("," + JSON.stringify(step) + "\n");
+
+                return;
+            }
+        }
+    }
+
+    // Add an autorecord for a user
+    function addAutorecord(uid, gid, cid) {
+        removeAutorecord(uid, gid);
+        var step = {u:uid, g:gid, c:cid};
+        if (!(uid in autoU2GC)) autoU2GC[uid] = [];
+        autoU2GC[uid].push({g:gid, c:cid});
+        autoG2UC[gid] = {u:uid, c:cid};
+        if (!dead && autoJournalF)
+            autoJournalF.write("," + JSON.stringify(step) + "\n");
+    }
+
+    // Resolve autorecords from U2GC into G2UC, asserting that the relevant uids actually have auto powers
+    function resolveAutos() {
+        autoG2UC = {};
+        Object.keys(autoU2GC).forEach((uid) => {
+            var f = features(uid);
+            if (f.auto) {
+                var gcs = autoU2GC[uid];
+                for (var gci = 0; gci < gcs.length; gci++) {
+                    var gc = gcs[gci];
+                    autoG2UC[gc.g] = {u:uid, c:gc.c};
+                }
+            } else {
+                delete autoU2GC[uid];
+            }
+        });
     }
 
     // Get our initial rewards on connection
@@ -1165,13 +1294,189 @@ if (config.rewards) (function() {
                 if (rn in rr)
                     role.members.forEach(resolveRewards);
             });
+
+            // Get our bless status
+            if (accessSyncer("craig-bless.json")) {
+                try {
+                    var journal = JSON.parse("["+fs.readFileSync("craig-bless.json", "utf8")+"]");
+                    blessU2G = journal[0];
+                    for (var ji = 1; ji < journal.length; ji++) {
+                        var step = journal[ji];
+                        if ("g" in step)
+                            blessU2G[step.u] = step.g;
+                        else
+                            delete blessU2G[step.u];
+                    }
+                } catch (ex) {}
+            }
+            resolveBlesses();
+            blessJournalF = fs.createWriteStream("craig-bless.json", "utf8");
+            blessJournalF.write(JSON.stringify(blessU2G) + "\n");
+
+
+            // And get our auto status
+            if (accessSyncer("craig-auto.json")) {
+                try {
+                    var journal = JSON.parse("["+fs.readFileSync("craig-auto.json", "utf8")+"]");
+                    autoU2GC = journal[0];
+                    for (var ji = 1; ji < journal.length; ji++) {
+                        var step = journal[ji];
+                        if ("c" in step)
+                            addAuto(step.u, step.g, step.c);
+                        else
+                            removeAuto(step.u, step.g);
+                    }
+                } catch (ex) {}
+            }
+            resolveAutos();
+            autoJournalF = fs.createWriteStream("craig-auto.json", "utf8");
+            autoJournalF.write(JSON.stringify(autoU2GC) + "\n");
         });
     });
 
     // Reresolve a member when their roles change
-    client.on("guildMemberUpdate", (from, to) => {
+    client.on("guildMemberUpdate", (to, from) => {
         if (to.guild.id !== config.rewards.guild) return;
-        if (from.roles === to.roles) return;
-        resolveRewards(to);
+        var r = resolveRewards(to);
+        if (!r.bless && to.id in blessU2G)
+            removeBless(to.id);
+    });
+
+    // And a command to bless a guild
+    commands["bless"] = function(msg, cmd) {
+        if (dead) return;
+
+        // Only makes sense in a guild
+        if (!msg.channel.guild) return;
+
+        var f = features(msg.author.id);
+        if (!f.bless) {
+            reply(msg, false, cmd[1], "You do not have permission to bless servers.");
+            return;
+        }
+
+        addBless(msg.author.id, msg.channel.guild.id);
+        reply(msg, false, cmd[1], "This server is now blessed. All recordings in this server have your added features.");
+    }
+
+    commands["unbless"] = function(msg, cmd) {
+        if (dead) return;
+
+        if (!(msg.author.id in blessU2G)) {
+            reply(msg, false, cmd[1], "But you haven't blessed a server!");
+        } else {
+            removeBless(msg.author.id);
+            reply(msg, false, cmd[1], "Server unblessed.");
+        }
+    }
+
+    // And a command to autorecord a channel
+    commands["autorecord"] = function(msg, cmd) {
+        if (dead) return;
+        if (!msg.channel.guild) return;
+        var cname = cmd[3].toLowerCase();
+
+        var f = features(msg.author.id);
+        if (!f.auto) {
+            reply(msg, false, cmd[1], "You do not have permission to set up automatic recordings.");
+            return;
+        }
+
+        if (cname === "off") {
+            if (msg.author.id in autoU2GC) {
+                var gcs = autoU2GC[msg.author.id];
+                for (var gci = 0; gci < gcs.length; gci++) {
+                    var gc = gcs[gci];
+                    if (gc.g === msg.channel.guild.id) {
+                        removeAutorecord(msg.author.id, gc.g);
+                        reply(msg, false, cmd[1], "Autorecord disabled.");
+                        return;
+                    }
+                }
+            }
+
+            reply(msg, false, cmd[1], "But you don't have an autorecord set on this server!");
+
+        } else {
+            var channel = findChannel(msg, msg.channel.guild, cname);
+            if (channel === null) {
+                reply(msg, false, cmd[1], "What channel?");
+                return;
+            }
+
+            addAutorecord(msg.author.id, msg.channel.guild.id, channel.id);
+            reply(msg, false, cmd[1], "I will now automatically record " + channel.name + ". Please make sure you can receive DMs from me; I will NOT send autorecord links publicly!");
+        }
+    }
+
+    // Watch for autorecord opportunities
+    function checkChannel(guild, voiceChannel) {
+        var guildId = guild.id;
+        if (!(guildId in autoG2UC)) return;
+        var uc = autoG2UC[guildId];
+        var channelId = voiceChannel.id;
+        if (!voiceChannel || uc.c !== channelId) return;
+
+        // Something has happened on a voice channel we're watching for autorecording
+        var recording = false, shouldRecord = false;
+        if (guildId in activeRecordings &&
+            channelId in activeRecordings[guildId])
+            recording = true;
+        voiceChannel.voiceMembers.some((member) => {
+            if (!member.user.bot) {
+                shouldRecord = true;
+                return true;
+            }
+            return false;
+        });
+
+        // Should we start or stop a recording?
+        if (recording !== shouldRecord) {
+            // OK, make sure we have everything we need
+            var member = guild.members.get(uc.u);
+            if (!member) {
+                guild.fetchAllMembers();
+                var ct = 0;
+                var fetchI = setInterval(()=>{
+                    member = guild.members.get(uc.u);
+                    if (member) {
+                        clearInterval(fetchI);
+                        then();
+                    } else {
+                        if (++ct === 10) {
+                            // Probably not here
+                            clearInterval(fetchI);
+                        }
+                    }
+                }, 100);
+            } else then();
+
+            function then() {
+                var msg = {
+                    author: member.user,
+                    member: member,
+                    channel: member,
+                    guild: guild,
+                    reply: (msg) => {
+                        return member.send(msg);
+                    }
+                };
+                if (shouldRecord)
+                    commands["join"](msg, ["", null, "join", voiceChannel.name]);
+                else
+                    commands["leave"](msg, ["", null, "leave", voiceChannel.name]);
+            }
+        }
+    }
+
+    client.on("voiceChannelJoin", (member, channel) => {
+        checkChannel(channel.guild, channel);
+    });
+    client.on("voiceChannelLeave", (member, channel) => {
+        checkChannel(channel.guild, channel);
+    });
+    client.on("voiceChannelSwitch", (member, to, from) => {
+        checkChannel(to.guild, to);
+        checkChannel(from.guild, from);
     });
 })();
