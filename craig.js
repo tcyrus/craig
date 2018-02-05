@@ -1172,7 +1172,8 @@ if (config.rewards) (function() {
         var rr = config.rewards.roles;
         var mrewards = {};
 
-        member.roles.forEach((role) => {
+        member.roles.forEach((rid) => {
+            var role = member.guild.roles.get(rid);
             var rn = role.name.toLowerCase();
             if (rn in rr) {
                 var roler = rr[rn];
@@ -1288,12 +1289,10 @@ if (config.rewards) (function() {
         var rr = config.rewards.roles;
         var guild = client.guilds.get(config.rewards.guild);
         if (!guild) return;
-        guild.fetchMembers().then((guild) => {
-            guild.roles.forEach((role) => {
-                var rn = role.name.toLowerCase();
-                if (rn in rr)
-                    role.members.forEach(resolveRewards);
-            });
+        guild.fetchAllMembers();
+        setTimeout(then, 1000);
+        function then() {
+            guild.members.forEach(resolveRewards);
 
             // Get our bless status
             if (accessSyncer("craig-bless.json")) {
@@ -1331,7 +1330,7 @@ if (config.rewards) (function() {
             resolveAutos();
             autoJournalF = fs.createWriteStream("craig-auto.json", "utf8");
             autoJournalF.write(JSON.stringify(autoU2GC) + "\n");
-        });
+        }
     });
 
     // Reresolve a member when their roles change
@@ -1422,7 +1421,7 @@ if (config.rewards) (function() {
         if (guildId in activeRecordings &&
             channelId in activeRecordings[guildId])
             recording = true;
-        voiceChannel.voiceMembers.some((member) => {
+        voiceChannel.voiceMembers.find((member) => {
             if (!member.user.bot) {
                 shouldRecord = true;
                 return true;
@@ -1455,10 +1454,11 @@ if (config.rewards) (function() {
                 var msg = {
                     author: member.user,
                     member: member,
-                    channel: member,
-                    guild: guild,
-                    reply: (msg) => {
-                        return member.send(msg);
+                    channel: {
+                        guild: guild,
+                        createMessage: (msg) => {
+                            return new Promise((y,n)=>{n({});});
+                        }
                     }
                 };
                 if (shouldRecord)
