@@ -1119,30 +1119,36 @@ setInterval(() => {
         });
     }
 
-    if (config.discordbotstoken) {
-        // Report to discordbots.org
+    if (config.discordbotstoken || config.botsdiscordpwtoken) {
+        // Report to bots lists
         client = clients[0];
-        try {
-            var curServerCount = client.guilds.size;
-            if (lastServerCount === curServerCount)
-                return;
-            lastServerCount = curServerCount;
-            var postData = JSON.stringify({
-                server_count: curServerCount
-            });
-            var req = https.request({
-                hostname: "discordbots.org",
-                path: "/api/bots/" + client.user.id + "/stats",
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Content-Length": postData.length,
-                    "Authorization": config.discordbotstoken
-                }
-            }, () => {});
-            req.write(postData);
-            req.end();
-        } catch(ex) {}
+        var domains = {discordbotstoken: "discordbots.org", botsdiscordpwtoken: "bots.discord.pw"};
+        for (var tname in domains) {
+            if (!(tname in config)) continue;
+            var domain = domains[tname];
+            var dtoken = config[tname];
+            try {
+                var curServerCount = client.guilds.size;
+                if (lastServerCount === curServerCount)
+                    return;
+                lastServerCount = curServerCount;
+                var postData = JSON.stringify({
+                    server_count: curServerCount
+                });
+                var req = https.request({
+                    hostname: domain,
+                    path: "/api/bots/" + client.user.id + "/stats",
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Content-Length": postData.length,
+                        "Authorization": dtoken
+                    }
+                }, () => {});
+                req.write(postData);
+                req.end();
+            } catch(ex) {}
+        }
     }
 }, 3600000);
 
@@ -1395,9 +1401,9 @@ if (config.rewards) (function() {
                     for (var ji = 1; ji < journal.length; ji++) {
                         var step = journal[ji];
                         if ("c" in step)
-                            addAuto(step.u, step.g, step.c, step.t);
+                            addAutorecord(step.u, step.g, step.c, step.t);
                         else
-                            removeAuto(step.u, step.g);
+                            removeAutorecord(step.u, step.g);
                     }
                 } catch (ex) {}
             }
