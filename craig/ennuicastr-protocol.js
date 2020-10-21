@@ -21,7 +21,7 @@
  */
 
 (function() {
-    var EnnuiCastrProtocol = {
+    const EnnuiCastrProtocol = {
         "ids": {
             "ack": 0x00,
 
